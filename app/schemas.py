@@ -6,6 +6,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
+#: 单格计数与单条行/列合计允许的最大值（有符号 64 位整数 BIGINT 上界）。
+#: 注意整表 grand_total 不受此限制，可超过 2**63-1 并以 JSON 整数精确返回。
+BIGINT_MAX = (1 << 63) - 1
+
 # 示例数据（行列序号均从 0 开始，与请求中的矩阵下标一致）---------------
 
 # 示例 1：3x3，4 个隐藏格构成自由块，取值为区间，不可还原。
@@ -72,7 +76,7 @@ class SuppressionRequest(BaseModel):
     @classmethod
     def _validate_matrix_cells(cls, value):
         # StrictInt 在联合类型里仍可能放行 bool（bool 是 int 子类），显式拒绝；
-        # 同时统一拦截负数
+        # 同时统一拦截负数与超过 BIGINT 上界的计数。
         for i, row in enumerate(value):
             for j, cell in enumerate(row):
                 if isinstance(cell, bool):
@@ -81,6 +85,11 @@ class SuppressionRequest(BaseModel):
                     )
                 if cell is not None and cell < 0:
                     raise ValueError(f"matrix[{i}][{j}] 不能为负数：{cell}")
+                if cell is not None and cell > BIGINT_MAX:
+                    raise ValueError(
+                        f"matrix[{i}][{j}] = {cell} 超过有符号 64 位整数"
+                        f"（BIGINT）上界 {BIGINT_MAX}"
+                    )
         return value
 
     @field_validator("row_totals", "col_totals")
@@ -91,6 +100,11 @@ class SuppressionRequest(BaseModel):
                 raise ValueError(f"合计值不能是布尔值：位置 {i}")
             if cell < 0:
                 raise ValueError(f"合计值不能为负数：位置 {i} = {cell}")
+            if cell > BIGINT_MAX:
+                raise ValueError(
+                    f"位置 {i} 的合计值 {cell} 超过有符号 64 位整数"
+                    f"（BIGINT）上界 {BIGINT_MAX}；整表总计不受此限"
+                )
         return value
 
     @model_validator(mode="after")

@@ -103,3 +103,74 @@ def test_method_endpoint():
     resp = client.get("/method")
     assert resp.status_code == 200
     assert "全幺模" in resp.json()["model"]
+
+
+def test_bigint_grand_total_exact_beyond_int64():
+    """总计超 2^63 仍以 JSON 整数精确返回，遮盖格区间不被浮点误判。"""
+    b63 = (1 << 63) - 1
+    payload = {
+        "matrix": [[None] * 12 for _ in range(12)],
+        "row_totals": [b63] * 12,
+        "col_totals": [b63] * 12,
+    }
+    resp = client.post("/api/v1/suppression-check", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    expected_total = 12 * b63
+    assert body["grand_total"] == expected_total
+    assert body["grand_total"] > (1 << 63) - 1
+    # JSON 文本里必须是整数字面量，不带小数点/指数（精确承载）。
+    raw = resp.content.decode()
+    assert str(expected_total) in raw
+    assert "." not in str(body["grand_total"])
+    assert all(c["recoverable"] is False for c in body["cells"])
+    first = body["cells"][0]
+    assert body["minimizer_matrix"][first["row"]][first["col"]] == first["min"]
+    assert body["maximizer_matrix"][first["row"]][first["col"]] == first["max"]
+
+
+def test_int64_overflow_returns_422():
+    """单格或单项合计超 2^63-1 在参数校验层即 422。"""
+    b63 = (1 << 63) - 1
+    overflow_cell = {
+        "matrix": [[b63 + 1, None]],
+        "row_totals": [b63 + 1],
+        "col_totals": [b63 + 1, 0],
+    }
+    resp = client.post("/api/v1/suppression-check", json=overflow_cell)
+    assert resp.status_code == 422
+
+    overflow_margin = {
+        "matrix": [[1, None]],
+        "row_totals": [b63 + 1],
+        "col_totals": [1, b63],
+    }
+    resp = client.post("/api/v1/suppression-check", json=overflow_margin)
+    assert resp.status_code == 422
+
+
+def test_bigint_recoverable_not_misjudged():
+    """BIGINT 边界下本可还原的格子 min==max，且响应结构保持不变。"""
+    b63 = (1 << 63) - 1
+    payload = {
+        "matrix": [[b63, None], [None, b63]],
+        "row_totals": [b63, b63],
+        "col_totals": [b63, b63],
+    }
+    resp = client.post("/api/v1/suppression-check", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["grand_total"] == 2 * b63
+    assert body["hidden_count"] == 2
+    assert body["recoverable_count"] == 2
+    assert all(c["recoverable"] and c["min"] == c["max"] for c in body["cells"])
+    assert set(body) == {
+        "status",
+        "dimensions",
+        "grand_total",
+        "hidden_count",
+        "recoverable_count",
+        "cells",
+        "minimizer_matrix",
+        "maximizer_matrix",
+    }

@@ -265,3 +265,125 @@ def test_schema_rejects_malformed_inputs():
     for payload in bad_cases:
         with _pt.raises(Exception):
             SuppressionRequest(**payload)
+
+
+# ---------------------------------------------------------------------------
+# BIGINT 边界与任意精度整数（本次修复的回归测试）
+# ---------------------------------------------------------------------------
+
+B63 = (1 << 63) - 1
+
+
+def test_bigint_boundary_recoverable_exact():
+    """单格与行列合计取 2^63-1：纯整数精确求解，不被浮点舍入误伤。"""
+    payload = {
+        "matrix": [[B63, None], [None, B63]],
+        "row_totals": [B63, B63],
+        "col_totals": [B63, B63],
+    }
+    result = solver.analyze(**payload)
+    # 整表总计 = 2*(2^63-1)，超过 2^63-1 仍须精确返回。
+    assert result["grand_total"] == 2 * B63
+    assert result["grand_total"] > B63
+    by_pos = {(c["row"], c["col"]): c for c in result["cells"]}
+    for pos in ((0, 1), (1, 0)):
+        cell = by_pos[pos]
+        assert cell["min"] == 0 and cell["max"] == 0
+        assert cell["recoverable"] is True
+    for key in ("minimizer_matrix", "maximizer_matrix"):
+        m = result[key]
+        assert all(sum(m[i]) == payload["row_totals"][i] for i in range(2))
+        assert all(
+            sum(m[i][j] for i in range(2)) == payload["col_totals"][j]
+            for j in range(2)
+        )
+
+
+def test_grand_total_beyond_int64_is_exact():
+    """每条行列合计 <= 2^63-1，但 12 行累加之和远超 2^63，须逐位精确。"""
+    n = 12
+    matrix = [[None] * n for _ in range(n)]
+    row_totals = [B63] * n
+    col_totals = [B63] * n
+    result = solver.analyze(matrix, row_totals, col_totals)
+    expected_total = 12 * B63
+    assert result["grand_total"] == expected_total
+    assert result["grand_total"] > (1 << 63) - 1
+    # 全遮盖规则二分图：每个遮盖格可取 0..B63，均不可还原。
+    assert result["hidden_count"] == n * n
+    assert all(c["min"] == 0 and c["max"] == B63 for c in result["cells"])
+    assert all(c["recoverable"] is False for c in result["cells"])
+    first = result["cells"][0]
+    assert result["minimizer_matrix"][first["row"]][first["col"]] == 0
+    assert result["maximizer_matrix"][first["row"]][first["col"]] == B63
+    for m in (result["minimizer_matrix"], result["maximizer_matrix"]):
+        assert all(sum(m[i]) == B63 for i in range(n))
+        assert all(sum(m[i][j] for i in range(n)) == B63 for j in range(n))
+
+
+def test_scale_above_2p53_keeps_real_ranges():
+    """2^53 之上旧浮点 LP 会误判；这里有自由区间的遮盖格必须仍不可还原。"""
+    p53 = 1 << 53
+    payload = {
+        "matrix": [
+            [p53, None, None],
+            [None, p53, None],
+            [None, None, p53],
+        ],
+        "row_totals": [3 * p53] * 3,
+        "col_totals": [3 * p53] * 3,
+    }
+    result = solver.analyze(**payload)
+    assert result["grand_total"] == 9 * p53
+    # 与小规模同构问题对照：自由块遮盖格存在非平凡区间。
+    assert any(c["min"] < c["max"] for c in result["cells"])
+    assert any(c["recoverable"] is False for c in result["cells"])
+    for m in (result["minimizer_matrix"], result["maximizer_matrix"]):
+        assert all(sum(m[i]) == payload["row_totals"][i] for i in range(3))
+        assert all(
+            sum(m[i][j] for i in range(3)) == payload["col_totals"][j]
+            for j in range(3)
+        )
+
+
+def test_solver_rejects_cell_or_margin_above_int64():
+    """单格或单项行列合计超过 2^63-1 时 solver 层同样拒绝。"""
+    over = B63 + 1
+    with pytest.raises(solver.SuppressionConflict):
+        solver.analyze([[over, None]], [over], [over, 0])
+    with pytest.raises(solver.SuppressionConflict):
+        solver.analyze([[1, None]], [over], [1, over - 1])
+
+
+def test_witness_matrices_hit_first_cell_bounds_bigint():
+    """大整数见证矩阵必须让首个遮盖格分别达到其下界与上界。"""
+    payload = {
+        "matrix": [
+            [B63 // 2, None, None, 100],
+            [None, B63 // 2, 50, None],
+            [None, 70, B63 // 2, None],
+            [200, None, None, B63 // 2],
+        ],
+        "row_totals": [
+            4611686020427387903,
+            4611686021427387903,
+            4611686019427387903,
+            4611686022427387903,
+        ],
+        "col_totals": [
+            4611686021127388103,
+            4611686020727387973,
+            4611686022127387653,
+            4611686019727387883,
+        ],
+    }
+    result = solver.analyze(**payload)
+    assert result["grand_total"] > B63
+    first = result["cells"][0]
+    assert first["min"] < first["max"]
+    assert (
+        result["minimizer_matrix"][first["row"]][first["col"]] == first["min"]
+    )
+    assert (
+        result["maximizer_matrix"][first["row"]][first["col"]] == first["max"]
+    )
